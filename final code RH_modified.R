@@ -1,0 +1,376 @@
+#load library
+library(tidyr) #datawrangling
+library(ggplot2) #ploting
+library(dplyr) #datawrangling
+library(zoo) #forecast
+library(lubridate) #datetimethings
+library(forecast) #forecast
+library(imputeTS) #impute
+library(reshape2) #reshape
+
+
+#Custom Functions
+data_cleaning = function(filename, num_lanes = 15){
+  #read in data
+  rh.data <- paste0(filename, ".csv")
+  df <- read.csv(rh.data,fileEncoding="latin1")
+  colsneeded <- c("BL_AWB_PRO",
+                  "container_num",
+                  "shipment_id",
+                  "origin_city",
+                  "pol_city",
+                  "pod_city",
+                  "bl_city",
+                  "Service.Type",
+                  "Carrier.Name",
+                  "Actual.Cargo.Receipt.Date.Date",
+                  "Departed.Date",
+                  "Arrived.at.Delivery.Location.Date",
+                  "Container.Type",
+                  "Actual.Volume..CBM.")
+  small_df <- df[colsneeded]
+  # Renaming the cols for easy access
+  names(small_df) <- c("BL_num",
+                       "Container_num",
+                       "Shipment_id",
+                       "Origin_city",
+                       "POL_city",
+                       "POD_city",
+                       "BL_city",
+                       "Service_type",
+                       "Carrier",
+                       "Cargo_receipt_date",
+                       "Departed_date",
+                       "Delivery_date",
+                       "Container_type",
+                       "Volume")
+  
+  ## create the Lane column by concatenating the origin city, pol city, pod city and BL city, connect 4 locations with " _ "
+  # example of a lane: "Vung Tau _ Vung Tau _ Oakland _ Patterson"
+  small_df$Lane = paste(small_df$Origin_city,"_",small_df$POL_city,"_",small_df$POD_city,"_",small_df$BL_city)
+  
+  
+  ## Combine lanes that are similiar in nature. 
+  # example: the "Vung Tau _ Vung Tau _ Oakland _ Oakland" lane has changed its bl location to "Patterson" in recent years
+  # therefore we can consider "Vung Tau _ Vung Tau _ Oakland _ Oakland" and "Vung Tau _ Vung Tau _ Oakland _ Patterson" as the same lane
+  # combine those 2 lanes and name it "Vung Tau _ Vung Tau _ Oakland _ Patterson" by changing the lane name from "Vung Tau _ Vung Tau _ Oakland _ Oakland" to "Vung Tau _ Vung Tau _ Oakland _ Patterson"
+  
+  #combine Vung Tau _ Vung Tau _ Oakland _ Oakland with Vung Tau _ Vung Tau _ Oakland _ Patterson
+  small_df$Lane[which(small_df$Lane=="Vung Tau _ Vung Tau _ Oakland _ Oakland")] <- "Vung Tau _ Vung Tau _ Oakland _ Patterson"
+  #combine Ningbo _ Ningbo _ Oakland _ Oakland with Ningbo _ Ningbo _ Oakland _ Patterson
+  small_df$Lane[which(small_df$Lane=="Ningbo _ Ningbo _ Oakland _ Oakland")] <- "Ningbo _ Ningbo _ Oakland _ Patterson"
+  #combine Yantian _ Yantian _ Oakland _ Oakland with Ningbo _ Ningbo _ Oakland _ Patterson
+  small_df$Lane[which(small_df$Lane=="Yantian _ Yantian _ Oakland _ Oakland")] <- "Yantian _ Yantian _ Oakland _ Patterson"
+  
+  
+  ## coerce the categorical column to factor format
+  colnames_df <- as.vector(colnames(small_df))
+  categorical_vars<-c("BL_num",
+                      "Container_num",
+                      "Shipment_id",
+                      "Origin_city",
+                      "POL_city",
+                      "POD_city",
+                      "BL_city",
+                      "Service_type",
+                      "Carrier",
+                      # "Cargo_receipt_date",
+                      # "Departed_date",
+                      # "Delivery_date",
+                      "Container_type",
+                      "Lane")
+  small_df[categorical_vars] <- lapply(small_df[categorical_vars], as.factor)
+  
+  # coerce the Date column to Date format
+  date_vars <- c("Cargo_receipt_date",
+                 "Departed_date",
+                 "Delivery_date")
+  small_df[date_vars] <- lapply(small_df[date_vars], function(x) as.Date(x,"%m/%d/%Y"))
+  
+  # Filtering out rows with <50 CBM volume
+  small_df <- filter(small_df, Volume > 50)
+  
+  # Getting month wise grouping
+  small_df$Dep_month <- floor_date(small_df$Departed_date, "month")
+  
+  #group by shipping lanes
+  volume_by_lanes <- small_df %>%
+    select("Lane","Volume","Dep_month") %>%
+    group_by(Lane) %>%
+    summarize(total = sum(Volume),
+              minyear=min(year(Dep_month)),
+              maxyear=max(year(Dep_month)))%>%
+    arrange(desc(total))
+  
+  #drop lanes that has no shipment at/after 2019
+  volume_by_lanes <- volume_by_lanes %>% filter(maxyear >= 2019)
+  
+  ##### generate dataframe for each lane
+  lane_result = list()
+  i=1
+  for(laneName in volume_by_lanes$Lane[1:num_lanes]){
+    laneDf <- small_df%>%
+      filter(Lane==laneName)%>%
+      select("Lane","Volume","Departed_date","Dep_month")%>%
+      arrange(Departed_date)%>%
+      group_by(Dep_month)%>%
+      summarize(monthly_volume=sum(Volume))
+    # generate a sequence of complete months between the start date and end date in the data
+    complete_month <- data.frame(seq(laneDf$Dep_month[1], laneDf$Dep_month[nrow(laneDf)], "month"))
+    names(complete_month) <- "Dep_month"
+    # combine the datasets and reveal the missing values
+    complete_laneDf <- complete_month %>% left_join(laneDf, by = "Dep_month")
+    # write.csv(complete_laneDf,paste("/Users/yuxuanli/Desktop/备份/spring 2022/Industry Practium/top20lanes_0319/",i,laneName,".csv"))
+    lane_result[[laneName]] = complete_laneDf
+    plot(complete_laneDf,type="o",main=laneName)
+    # print(laneName)
+    i=i+1
+    
+  }
+  
+  return(lane_result)
+}
+
+
+foralllane = function(name, alllanesfinal){
+  
+  #read data
+  lanedt <- lanedata[[name]]
+  
+  if (nrow(lanedt)<24 | mean(is.na(lanedt[2]))>0.5){
+    print("no enough data for modeling")
+  }else{
+    #getting the start and end years and months of the time series
+    mindt <- min(lanedt$Dep_month)
+    maxdt <- max(lanedt$Dep_month)
+    startts <- c(year(mindt), month(mindt))
+    endts <- c(year(maxdt), month(maxdt))
+    
+    # Check is na present
+    if (sum(is.na(lanedt[2])) == 0){
+      
+      # No imputation
+      fullts_no <- ts(lanedt$monthly_volume, start = startts,
+                      end = endts, freq = 12)
+      
+      #Forecasting with the best model and plotting
+      nums_no <- forecastnplot(fullts_no, timehorizon = 12, name)
+      
+      # Adding the result to the dataframe
+      alllanesfinal[nrow(alllanesfinal)+1,] <- c(name,nums_no[1],
+                                                 round(as.numeric(nums_no[2]),2),
+                                                 round(as.numeric(nums_no[3]),2),
+                                                 round(as.numeric(nums_no[4]),2),
+                                                 round(as.numeric(nums_no[5]),2),
+                                                 round(as.numeric(nums_no[6]),2),
+                                                 round(as.numeric(nums_no[7]),2),
+                                                 round(as.numeric(nums_no[8]),2),
+                                                 round(as.numeric(nums_no[9]),2),
+                                                 round(as.numeric(nums_no[10]),2),
+                                                 round(as.numeric(nums_no[11]),2),
+                                                 round(as.numeric(nums_no[12]),2),
+                                                 round(as.numeric(nums_no[13]),2),
+                                                 round(as.numeric(nums_no[14]),2),
+                                                 round(as.numeric(nums_no[15]),2),
+                                                 round(as.numeric(nums_no[16]),2))
+    } else {
+      
+      #Impute missing values if any using the mean of the whole time series
+      fullts_mean <- ts(na_mean(lanedt$monthly_volume), start = startts,
+                        end = endts, freq = 12)
+      # No imputation
+      fullts_no <- ts(lanedt$monthly_volume, start = startts,
+                      end = endts, freq = 12)
+      
+      #Forecasting with the best model and plotting
+      nums_mean <- forecastnplot(fullts_mean, timehorizon = 12, name)
+      nums_no <- forecastnplot(fullts_no, timehorizon = 12, name)
+      
+      print(paste0("forecast result with mean imp:",nums_mean))
+      print(paste0("forecast result with no imp:",nums_no))
+    
+      
+      if (round(as.numeric(nums_mean[1],2)) < round(as.numeric(nums_no[1],2))){
+
+        alllanesfinal[nrow(alllanesfinal)+1,] <- c(name,nums_mean[1],
+                                                   round(as.numeric(nums_mean[2]),2),
+                                                   round(as.numeric(nums_mean[3]),2),
+                                                   round(as.numeric(nums_mean[4]),2),
+                                                   round(as.numeric(nums_mean[5]),2),
+                                                   round(as.numeric(nums_mean[6]),2),
+                                                   round(as.numeric(nums_mean[7]),2),
+                                                   round(as.numeric(nums_mean[8]),2),
+                                                   round(as.numeric(nums_mean[9]),2),
+                                                   round(as.numeric(nums_mean[10]),2),
+                                                   round(as.numeric(nums_mean[11]),2),
+                                                   round(as.numeric(nums_mean[12]),2),
+                                                   round(as.numeric(nums_mean[13]),2),
+                                                   round(as.numeric(nums_mean[14]),2),
+                                                   round(as.numeric(nums_mean[15]),2),
+                                                   round(as.numeric(nums_mean[16]),2))}
+      else{
+        alllanesfinal[nrow(alllanesfinal)+1,] <- c(name,nums_no[1],
+                                                   round(as.numeric(nums_no[2]),2),
+                                                   round(as.numeric(nums_no[3]),2),
+                                                   round(as.numeric(nums_no[4]),2),
+                                                   round(as.numeric(nums_no[5]),2),
+                                                   round(as.numeric(nums_no[6]),2),
+                                                   round(as.numeric(nums_no[7]),2),
+                                                   round(as.numeric(nums_no[8]),2),
+                                                   round(as.numeric(nums_no[9]),2),
+                                                   round(as.numeric(nums_no[10]),2),
+                                                   round(as.numeric(nums_no[11]),2),
+                                                   round(as.numeric(nums_no[12]),2),
+                                                   round(as.numeric(nums_no[13]),2),
+                                                   round(as.numeric(nums_no[14]),2),
+                                                   round(as.numeric(nums_no[15]),2),
+                                                   round(as.numeric(nums_no[16]),2))
+      }
+    }
+    return(alllanesfinal)
+  }
+}
+
+
+forecastnplot = function(fullts, timehorizon = 12, nameofplot) {
+  
+  #defining ets and autoarima functions for tsCV use
+  fets <- function(x, h) {
+    forecast(ets(x, lambda = 0), h = h)
+  }
+  farima <- function(x, h) {
+    forecast(auto.arima(x, lambda = 0), h = h)
+  }
+  
+  # Compute CV errors for ETS as e1
+  e1 <- tsCV(fullts, fets, h = timehorizon)
+  # Compute CV errors for ARIMA as e2
+  e2 <- tsCV(fullts, farima, h = timehorizon)
+  
+  # Find MAPE of each model class
+  mape1 <- sum(abs(e1)/fullts, na.rm = TRUE)*100/length(e1)
+  mape2 <- sum(abs(e2)/fullts, na.rm = TRUE)*100/length(e2)
+  print(paste0("mape1(ETS model) is :",mape1))
+  print(paste0("mape2(Arima model) is :",mape2))
+  
+  if (as.numeric(mape1) < as.numeric(mape2)){
+    
+    print(paste("model used: ETS"))
+    
+    ## Model and forecast
+    mod <- fullts %>% ets(lambda = 0) 
+    fct <- mod %>% forecast(h = timehorizon, level = 0)
+    
+    ## Getting the (12 month) monthly contract value, yearly contract value, 95% CI of forecasted yearly volume, and model error for each lane
+    # Getting the monthly contract value
+    forecastvalue<-data.frame(Volume=fct$mean)
+    contractval1<-forecastvalue[1,]
+    contractval2<-forecastvalue[2,]
+    contractval3<-forecastvalue[3,]
+    contractval4<-forecastvalue[4,]
+    contractval5<-forecastvalue[5,]
+    contractval6<-forecastvalue[6,]
+    contractval7<-forecastvalue[7,]
+    contractval8<-forecastvalue[8,]
+    contractval9<-forecastvalue[9,]
+    contractval10<-forecastvalue[10,]
+    contractval11<-forecastvalue[11,]
+    contractval12<-forecastvalue[12,]
+    # Getting the yearly contract value
+    contractval <- sum(fct$mean)
+    # 95% Confidence Interval of forecasted yearly volume
+    mincontractval <- sum(fct$lower)
+    maxcontractval <- sum(fct$upper)
+    # Getting the model error
+    mapeval <- mape1
+
+    
+    ## Plotting
+    plot(fct, main = nameofplot, xlab = "Years",
+         ylab = "Volume (CBM)")
+    lines(fct$fitted, col=3)
+    lines(fullts, col = "Black")
+    
+    return(c(mapeval,mincontractval, contractval, maxcontractval,contractval1,contractval2,contractval3,contractval4,contractval5,contractval6,
+             contractval7,contractval8,contractval9,contractval10,contractval11,contractval12))
+    
+  } else {
+    
+    print(paste("model used: Arima"))
+    
+    ## Model and forecast
+    mod <- fullts %>% auto.arima(lambda = 0) 
+    fct <- mod %>% forecast(h = timehorizon, level = 0)
+    
+    ## Getting the (12 month) monthly contract value, yearly contract value, 95% CI of forecasted yearly volume, and model error for each lane
+    # Getting the monthly contract value
+    forecastvalue<-data.frame(Volume=fct$mean)
+    contractval1<-forecastvalue[1,]
+    contractval2<-forecastvalue[2,]
+    contractval3<-forecastvalue[3,]
+    contractval4<-forecastvalue[4,]
+    contractval5<-forecastvalue[5,]
+    contractval6<-forecastvalue[6,]
+    contractval7<-forecastvalue[7,]
+    contractval8<-forecastvalue[8,]
+    contractval9<-forecastvalue[9,]
+    contractval10<-forecastvalue[10,]
+    contractval11<-forecastvalue[11,]
+    contractval12<-forecastvalue[12,]
+    # Getting the yearly contract value
+    contractval <- sum(fct$mean)
+    # 95% Confidence Interval of forecasted yearly volume
+    mincontractval <- sum(fct$lower)
+    maxcontractval <- sum(fct$upper)
+    # Getting the model error
+    mapeval <- mape2
+
+    
+    ## Plotting
+    plot(fct, main = nameofplot, xlab = "Years",
+         ylab = "Volume (CBM)")
+    lines(fct$fitted, col=3)
+    lines(fullts, col = "Black")
+  
+  return(c(mapeval,mincontractval, contractval, maxcontractval,contractval1,contractval2,contractval3,contractval4,contractval5,contractval6,
+           contractval7,contractval8,contractval9,contractval10,contractval11,contractval12))}
+
+}
+
+
+#run the data_cleaning function
+num_lanes = 20
+lanedata <- data_cleaning("rh.data0226", num_lanes)
+
+#get the name of all lanes
+lnames <- names(lanedata)
+
+##to get the sum of total volume
+##lapply(lanedata, function(x) sum(x[,2], na.rm = TRUE))
+##Reduce("+", lsum)
+
+
+alllanesfinal <- data.frame(Name = character(), MAPE = double(),
+                            Min_Annual_ContractVal = double(), 
+                            Annual_ContractVal = double(),
+                            Max_Annual_ContractVal = double(),
+                            Jan_ContractVal = double(),Feb_ContractVal = double(),Mar_ContractVal = double(),Apr_ContractVal = double(),
+                            May_ContractVal = double(),Jun_ContractVal = double(),Jul_ContractVal = double(),Aug_ContractVal = double(),
+                            Sep_ContractVal = double(),Oct_ContractVal = double(),Nov_ContractVal = double(),Dec_ContractVal = double()
+                            )
+
+for (x in 1:num_lanes){
+  result <- foralllane(lnames[x], alllanesfinal)
+  if (class(result) == "character"){
+    print(result)
+  }else{
+    alllanesfinal <- result
+    print(x)
+  } 
+}
+
+View(alllanesfinal)
+
+## Write to csv
+# write.csv(alllanesfinal,"test2.csv")
+
